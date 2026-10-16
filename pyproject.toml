@@ -1,0 +1,19 @@
+[project]
+name = "streamguard"
+version = "0.1.0"
+description = "A local-first streaming data engineering platform"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
