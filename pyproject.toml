@@ -3,7 +3,9 @@ name = "streamguard"
 version = "0.1.0"
 description = "A local-first streaming data engineering platform"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "psycopg[binary]>=3.3.6",
+]
 
 [dependency-groups]
 dev = [

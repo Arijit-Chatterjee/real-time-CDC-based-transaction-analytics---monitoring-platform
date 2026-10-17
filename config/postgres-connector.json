@@ -1,0 +1,18 @@
+{
+    "name": "streamguard-postgres-connector",
+    "config": {
+        "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+        "plugin.name": "pgoutput",
+        "database.hostname": "postgres",
+        "database.port": "5432",
+        "database.user": "debezium",
+        "database.password": "debezium_local_dev",
+        "database.dbname": "streamguard",
+        "topic.prefix": "streamguard",
+        "table.include.list": "public.transactions",
+        "publication.name": "streamguard_publication",
+        "publication.autocreate.mode": "disabled",
+        "slot.name": "streamguard_transactions_slot",
+        "snapshot.mode": "initial"
+    }
+}
