@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "A local-first streaming data engineering platform"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "confluent-kafka>=2.16.0",
     "psycopg[binary]>=3.3.6",
 ]
 
