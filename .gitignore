@@ -12,6 +12,7 @@ metastore_db/
 .vscode/
 config/
 compose.yaml
+!airflow/compose.yaml
 # Generated data lake files
 lake/bronze/
 lake/silver/

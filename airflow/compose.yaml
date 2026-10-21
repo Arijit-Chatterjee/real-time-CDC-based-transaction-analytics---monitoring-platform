@@ -1,0 +1,25 @@
+
+services:
+  airflow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: streamguard-airflow
+    restart: unless-stopped
+    command: standalone
+    environment:
+      AIRFLOW_HOME: /opt/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - /var/run/docker.sock:/var/run/docker.sock
+    mem_limit: 1800m
+    cpus: 1.5
+    networks:
+      - streamguard_default
+
+networks:
+  streamguard_default:
+    external: true
