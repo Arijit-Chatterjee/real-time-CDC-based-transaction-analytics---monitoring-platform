@@ -8,13 +8,13 @@ from airflow.sdk import dag, task
 SPARK_CONTAINER = "streamguard-spark"
 
 SPARK_SUBMIT = (
-    'export HOME=/tmp/streamguard-home; '
+    "export HOME=/tmp/streamguard-home; "
     'export PYTHONPATH="$(printf "%s:" /opt/spark/python/lib/*.zip)"; '
     '/opt/spark/bin/spark-submit --master "local[2]" '
     '--packages "io.delta:delta-spark_4.2_2.13:4.4.1" '
-    '--conf spark.jars.ivy=/tmp/streamguard-ivy '
-    '--conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension '
-    '--conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog '
+    "--conf spark.jars.ivy=/tmp/streamguard-ivy "
+    "--conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension "
+    "--conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog "
 )
 
 
@@ -35,9 +35,16 @@ def run_spark_script(script_path: str) -> None:
                 logging.info(chunk.decode("utf-8", errors="replace"))
 
         if result.exit_code != 0:
+            error_output = (
+                output.decode("utf-8", errors="replace")
+                if isinstance(output, bytes)
+                else str(output or "")
+            )
+
             raise RuntimeError(
                 f"Spark script failed: {script_path}; "
-                f"exit code: {result.exit_code}"
+                f"exit code: {result.exit_code}\n"
+                f"Spark output:\n{error_output[-12000:]}"
             )
     finally:
         client.close()
@@ -53,25 +60,21 @@ def run_spark_script(script_path: str) -> None:
 )
 def gold_pipeline():
 
-    @task
+    @task(retries=1)
     def build_gold():
         run_spark_script("/opt/streamguard/src/gold/build_gold.py")
 
-    @task
+    @task(retries=1)
     def validate_gold():
         run_spark_script("/opt/streamguard/src/gold/validate_gold.py")
 
-    @task
+    @task(retries=1)
     def build_merchant_performance():
-        run_spark_script(
-            "/opt/streamguard/src/gold/build_merchant_performance.py"
-        )
+        run_spark_script("/opt/streamguard/src/gold/build_merchant_performance.py")
 
-    @task
+    @task(retries=1)
     def validate_merchant_performance():
-        run_spark_script(
-            "/opt/streamguard/src/gold/validate_merchant_performance.py"
-        )
+        run_spark_script("/opt/streamguard/src/gold/validate_merchant_performance.py")
 
     first = build_gold()
     second = validate_gold()
