@@ -10,3 +10,8 @@ spark-warehouse/
 metastore_db/
 *.log
 .vscode/
+config/
+# Generated data lake files
+lake/bronze/
+lake/silver/
+lake/gold/

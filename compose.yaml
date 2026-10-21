@@ -88,7 +88,19 @@ services:
     environment:
       KAFKA_CONNECT_URIS: http://debezium:8083
     restart: unless-stopped
-
+  spark:
+    image: spark:4.2.0-scala2.13-java17-python3-ubuntu
+    container_name: streamguard-spark
+    depends_on:
+      - kafka
+    ports:
+      - "4040:4040"
+    volumes:
+      - ./src:/opt/streamguard/src
+      - ./lake:/opt/streamguard/lake
+    working_dir: /opt/streamguard
+    command: ["bash", "-lc", "sleep infinity"]
+    restart: unless-stopped
 
 
 volumes:
