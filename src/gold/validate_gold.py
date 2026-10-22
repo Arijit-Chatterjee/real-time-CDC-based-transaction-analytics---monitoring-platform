@@ -51,8 +51,9 @@ def main() -> None:
                 | F.col("date_key").isNull()
                 | F.col("amount").isNull()
                 | F.col("currency").isNull()
+                | F.col("transaction_status").isNull()
             ),
-            "fact rows have required keys and amounts",
+            "fact rows have required keys, amounts, currency, and status",
         )
         require_no_rows(
             fact.filter(F.col("amount") < 0),
