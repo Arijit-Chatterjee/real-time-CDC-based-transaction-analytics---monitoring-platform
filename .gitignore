@@ -11,7 +11,7 @@ metastore_db/
 *.log
 .vscode/
 config/
-compose.yaml
+
 !airflow/compose.yaml
 # Generated data lake files
 lake/bronze/
