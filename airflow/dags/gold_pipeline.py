@@ -1,4 +1,6 @@
 import logging
+
+logger = logging.getLogger(__name__)
 from datetime import datetime
 
 import docker
@@ -26,16 +28,16 @@ def run_spark_script(script_path: str) -> None:
         command = f"{SPARK_SUBMIT}{script_path}"
 
         # 1. Log when the Spark script starts.
-        logging.info("Starting Spark script: %s", script_path)
+        logger.info("Starting Spark script: %s", script_path)
 
         result = spark.exec_run(["bash", "-lc", command])
 
         output = result.output
         if isinstance(output, bytes):
-            logging.info(output.decode("utf-8", errors="replace"))
+            logger.info(output.decode("utf-8", errors="replace"))
         elif output:
             for chunk in output:
-                logging.info(chunk.decode("utf-8", errors="replace"))
+                logger.info(chunk.decode("utf-8", errors="replace"))
 
         if result.exit_code != 0:
             error_output = (
@@ -51,7 +53,7 @@ def run_spark_script(script_path: str) -> None:
             )
 
         # 2. Log only after the script succeeds.
-        logging.info(
+        logger.info(
             "Spark script completed successfully: %s",
             script_path,
         )
