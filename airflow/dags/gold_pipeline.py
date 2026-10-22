@@ -1,9 +1,8 @@
-from datetime import datetime
 import logging
+from datetime import datetime
 
 import docker
 from airflow.sdk import dag, task
-
 
 SPARK_CONTAINER = "streamguard-spark"
 
@@ -25,6 +24,10 @@ def run_spark_script(script_path: str) -> None:
         spark = client.containers.get(SPARK_CONTAINER)
 
         command = f"{SPARK_SUBMIT}{script_path}"
+
+        # 1. Log when the Spark script starts.
+        logging.info("Starting Spark script: %s", script_path)
+
         result = spark.exec_run(["bash", "-lc", command])
 
         output = result.output
@@ -46,6 +49,13 @@ def run_spark_script(script_path: str) -> None:
                 f"exit code: {result.exit_code}\n"
                 f"Spark output:\n{error_output[-12000:]}"
             )
+
+        # 2. Log only after the script succeeds.
+        logging.info(
+            "Spark script completed successfully: %s",
+            script_path,
+        )
+
     finally:
         client.close()
 
