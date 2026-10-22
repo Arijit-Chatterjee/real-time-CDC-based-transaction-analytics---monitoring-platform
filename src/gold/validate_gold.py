@@ -54,6 +54,18 @@ def main() -> None:
             ),
             "fact rows have required keys and amounts",
         )
+        require_no_rows(
+            fact.filter(F.col("amount") < 0),
+            "fact transaction amounts are non-negative",
+        )
+
+        require_no_rows(
+            fact.filter(
+                (F.length(F.trim(F.col("currency"))) == 0)
+                | (F.length(F.trim(F.col("transaction_status"))) == 0)
+            ),
+            "fact currency and transaction status are non-blank",
+        )
 
         require_no_rows(
             fact.join(
