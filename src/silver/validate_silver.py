@@ -10,6 +10,27 @@ TABLES = {
     "customers": "customer_id",
     "merchants": "merchant_id",
 }
+REQUIRED_COLUMNS = {
+    "transactions": [
+        "amount",
+        "customer_id",
+        "merchant_id",
+        "currency",
+        "event_time",
+        "operation",
+    ],
+    "customers": [
+        "created_at",
+        "account_status",
+        "operation",
+    ],
+    "merchants": [
+        "created_at",
+        "merchant_name",
+        "merchant_category",
+        "operation",
+    ],
+}
 
 
 def main() -> None:
@@ -42,18 +63,24 @@ def main() -> None:
             total_rows = df.count()
             null_keys = df.filter(df[primary_key].isNull()).count()
             duplicate_keys = df.groupBy(primary_key).count().filter("count > 1").count()
+            null_required_columns = {
+                column: df.filter(df[column].isNull()).count()
+                for column in REQUIRED_COLUMNS[table_name]
+            }
 
             print(f"Rows: {total_rows}", flush=True)
             print(f"Null primary keys: {null_keys}", flush=True)
             print(f"Duplicate primary keys: {duplicate_keys}", flush=True)
+            for column, count in null_required_columns.items():
+                print(f"Null {column}: {count}", flush=True)
             print("Schema:", flush=True)
             df.printSchema()
 
-            if null_keys or duplicate_keys:
+            if null_keys or duplicate_keys or any(null_required_columns.values()):
                 failures.append(table_name)
                 print("FAIL: Primary-key quality checks failed.", flush=True)
             else:
-                print("PASS: Primary-key quality checks passed.", flush=True)
+                print("PASS: All Silver data-quality checks passed.", flush=True)
 
         if failures:
             raise RuntimeError(f"Silver validation failed for: {', '.join(failures)}")
