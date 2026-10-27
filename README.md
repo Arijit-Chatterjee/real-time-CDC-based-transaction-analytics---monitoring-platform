@@ -303,20 +303,47 @@ Open the Airflow UI:
 
 Select `streamguard_gold_pipeline` and trigger a DAG run. The task views show the status and logs for each of the four tasks.
 
+## Run the End-to-End Transaction Demo
+
+StreamGuard includes a lightweight demo that inserts a transaction
+into PostgreSQL and lets you verify that it reaches the Gold lakehouse.
+
+### Prerequisites
+
+- The main Docker services are running.
+- The Bronze writers for transactions, customers, and merchants are running.
+- The Silver writer and Gold incremental writer are running.
+
+Starting Docker Compose alone does not automatically start the
+manually launched Spark streaming applications. Use the startup
+instructions in `docs/commands_to_know.md` when bringing the
+streaming pipeline online.
+
+### 1. Insert a Test Transaction
+
+From the project root, run:
+
+```powershell
+.\scripts\demo_transaction.ps1
+
 ## Project Structure
 
 ```text
 StreamGuard/
 ├── airflow/
+│   ├── Dockerfile
 │   ├── compose.yaml
 │   └── dags/
 │       └── gold_pipeline.py
 ├── config/
 ├── data/
 ├── docs/
+│   └── commands_to_know.md
 ├── lake/
 ├── logs/
 ├── scripts/
+│   ├── check_streamguard.ps1
+│   ├── demo_transaction.ps1
 │   └── run_gold_pipeline.ps1
 ├── sql/
 │   └── 001_event_ledger.sql
@@ -324,11 +351,19 @@ StreamGuard/
 │   ├── generator/
 │   ├── storage/
 │   ├── streaming/
+│   │   ├── bronze_writer.py
+│   │   ├── consumer.py
+│   │   ├── decoder.py
+│   │   └── processor.py
 │   ├── silver/
+│   │   ├── silver_writer.py
+│   │   └── validate_silver.py
 │   └── gold/
 │       ├── build_gold.py
-│       ├── validate_gold.py
 │       ├── build_merchant_performance.py
+│       ├── gold_incremental_writer.py
+│       ├── show_latest_transactions.py
+│       ├── validate_gold.py
 │       └── validate_merchant_performance.py
 ├── tests/
 ├── compose.yaml
