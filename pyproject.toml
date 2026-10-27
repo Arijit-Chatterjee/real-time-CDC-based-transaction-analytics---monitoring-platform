@@ -8,6 +8,12 @@ dependencies = [
     "psycopg[binary]>=3.3.6",
 ]
 
+[project.optional-dependencies]
+dashboard = [
+    "deltalake[pyarrow]>=1.6.6",
+    "streamlit>=1.66.1",
+]
+
 [dependency-groups]
 dev = [
     "pytest",
