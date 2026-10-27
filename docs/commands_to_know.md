@@ -250,5 +250,11 @@ Important ports	...
 Persistent data / volume paths	...
 Validation command	...
 
+## Start missing streaming writers
+
+From the project root in PowerShell:
+
+```powershell
+.\scripts\start_streaming_writers.ps1
 
 This prevents assumptions about names, ports, database users, or container image layouts when moving from StreamGuard to a different project or cloud environment.
