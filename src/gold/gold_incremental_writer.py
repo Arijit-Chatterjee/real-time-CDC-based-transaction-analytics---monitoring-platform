@@ -5,7 +5,7 @@ writer only after a successful Gold baseline and with CDF enabled on all three
 Silver tables. Do not run the full-refresh builder concurrently with this writer.
 
 Silver owns row-level business validation. This writer performs Gold
-transformations, dimension resolution, and idempotent Delta merges.
+transformations, dimension resolution, and idempotent Delta writes.
 """
 
 from __future__ import annotations
@@ -24,10 +24,9 @@ from pyspark.sql.window import Window
 SILVER_ROOT = "/opt/streamguard/lake/silver"
 GOLD_ROOT = "/opt/streamguard/lake/gold"
 CHECKPOINT_ROOT = "/opt/streamguard/lake/checkpoints/gold_incremental"
+
 _DATE_BOUNDS: tuple[date, date] | None = None
 
-# These versions establish the starting point covered by the existing
-# Gold baseline. Keep them aligned with your current Gold checkpoints.
 STARTING_VERSIONS = {
     "transactions": 6,
     "customers": 2,
@@ -37,6 +36,10 @@ STARTING_VERSIONS = {
 INR_HIGH_VALUE_THRESHOLD = 50_000
 PROCESSING_INTERVAL = "10 seconds"
 MAX_FILES_PER_TRIGGER = 5
+
+# Keep this value stable across restarts when reusing the same checkpoint.
+# If the checkpoint is deliberately reset, use a new transaction app ID.
+TRANSACTION_APPEND_APP_ID = "streamguard_gold_incremental_transactions_append"
 
 LOG = logging.getLogger("streamguard.gold.incremental")
 
@@ -58,12 +61,24 @@ def cdf_stream(spark: SparkSession, table_name: str) -> DataFrame:
 
 
 def latest_changes(batch: DataFrame, key_column: str) -> DataFrame:
-    """Keep the latest post-image or physical delete for each business key.
+    """Keep each key's latest applicable change and track its batch history.
 
-    Update-preimage rows are ignored. The resulting data has at most one
-    row per business key, so a separate duplicate-key Spark scan is redundant.
+    The history flag prevents the insert-only append path from being used
+    when a key has an update or delete anywhere in the same CDF microbatch.
     """
-    changes = batch.filter(
+    key_window = Window.partitionBy(key_column)
+
+    annotated = batch.withColumn(
+        "_has_non_insert_event",
+        F.max(
+            F.when(
+                F.col("_change_type") == F.lit("insert"),
+                F.lit(0),
+            ).otherwise(F.lit(1))
+        ).over(key_window),
+    )
+
+    changes = annotated.filter(
         F.col("_change_type").isin(
             "insert",
             "update_postimage",
@@ -71,7 +86,7 @@ def latest_changes(batch: DataFrame, key_column: str) -> DataFrame:
         )
     )
 
-    window = Window.partitionBy(key_column).orderBy(
+    latest_window = Window.partitionBy(key_column).orderBy(
         F.col("_commit_version").desc(),
         F.col("kafka_offset").desc_nulls_last(),
     )
@@ -79,10 +94,28 @@ def latest_changes(batch: DataFrame, key_column: str) -> DataFrame:
     return (
         changes.withColumn(
             "_row_number",
-            F.row_number().over(window),
+            F.row_number().over(latest_window),
         )
         .filter(F.col("_row_number") == 1)
         .drop("_row_number")
+    )
+
+
+def transaction_range_merge_condition(
+    minimum_id: str,
+    maximum_id: str,
+) -> str:
+    """Constrain fact-table target scans to the current batch's UUID range."""
+    if minimum_id is None or maximum_id is None:
+        raise ValueError("Cannot build a transaction merge condition without ID bounds")
+
+    minimum_literal = minimum_id.replace("'", "''")
+    maximum_literal = maximum_id.replace("'", "''")
+
+    return (
+        f"t.transaction_id >= '{minimum_literal}' "
+        f"AND t.transaction_id <= '{maximum_literal}' "
+        "AND t.transaction_id = s.transaction_id"
     )
 
 
@@ -165,11 +198,8 @@ def process_dimension_batch(
 ) -> None:
     """Merge the applicable CDF changes for one dimension microbatch."""
     key_column = "customer_id" if label == "customers" else "merchant_id"
-
     changes = latest_changes(batch, key_column)
 
-    # A batch may contain only update-preimage rows, which are ignored.
-    # One short action avoids issuing a Delta merge with an empty source.
     if changes.limit(1).count() == 0:
         LOG.info(
             "%s batch %s: no applicable CDF changes",
@@ -220,7 +250,7 @@ def build_date_dimension(
 
 
 def initialize_date_bounds(spark: SparkSession) -> None:
-    """Read the existing Gold date range once at startup."""
+    """Load the existing Gold date range once before starting the streams."""
     global _DATE_BOUNDS
 
     bounds = (
@@ -249,7 +279,7 @@ def ensure_date_keys(
     incoming_min: date | None,
     incoming_max: date | None,
 ) -> None:
-    """Extend dim_date only when an incoming event falls outside its range."""
+    """Extend dim_date only when an incoming event is outside its range."""
     global _DATE_BOUNDS
 
     if incoming_min is None or incoming_max is None:
@@ -261,8 +291,6 @@ def ensure_date_keys(
     assert _DATE_BOUNDS is not None
     existing_min, existing_max = _DATE_BOUNDS
 
-    # Normal transactions use dates already covered by the calendar.
-    # No Spark action is required for this common case.
     if incoming_min >= existing_min and incoming_max <= existing_max:
         return
 
@@ -316,23 +344,26 @@ def build_fact_rows(
     spark: SparkSession,
     transactions: DataFrame,
 ) -> DataFrame:
-    """Resolve Gold dimension keys and build transaction fact rows.
+    """Resolve dimension keys and build fact rows from validated Silver data."""
+    customers = F.broadcast(
+        read_gold(spark, "dim_customer").select(
+            "customer_key",
+            "customer_id",
+        )
+    )
 
-    Silver validates transaction fields. Gold retains the important guard
-    that all foreign keys can be resolved before writing the fact table.
-    The output is persisted because it is first checked and then merged.
-    """
-    customers = read_gold(spark, "dim_customer").select(
-        "customer_key",
-        "customer_id",
+    merchants = F.broadcast(
+        read_gold(spark, "dim_merchant").select(
+            "merchant_key",
+            "merchant_id",
+        )
     )
-    merchants = read_gold(spark, "dim_merchant").select(
-        "merchant_key",
-        "merchant_id",
-    )
-    dates = read_gold(spark, "dim_date").select(
-        "date_key",
-        "full_date",
+
+    dates = F.broadcast(
+        read_gold(spark, "dim_date").select(
+            "date_key",
+            "full_date",
+        )
     )
 
     joined = (
@@ -389,6 +420,7 @@ def build_fact_rows(
         F.col("t.ingested_at").alias("ingested_at"),
     ).persist(StorageLevel.MEMORY_AND_DISK)
 
+    # Retain the essential Gold referential-integrity guard.
     missing_key = (
         fact_rows.filter(
             F.col("customer_key").isNull()
@@ -402,17 +434,23 @@ def build_fact_rows(
     if missing_key:
         fact_rows.unpersist(blocking=False)
         raise ValueError(
-            "Cannot update Gold facts: a transaction has a missing "
-            "customer, merchant, or date key. The batch will fail without "
-            "advancing its checkpoint; check the dimension streams and retry."
+            "Cannot update Gold facts: a transaction has a missing customer, "
+            "merchant, or date key. The batch will fail without advancing its "
+            "checkpoint; check the dimension streams and retry."
         )
 
     return fact_rows
 
 
-def process_transaction_batch(batch: DataFrame, batch_id: int) -> None:
+def process_transaction_batch(
+    batch: DataFrame,
+    batch_id: int,
+) -> None:
+    """Apply CDF changes using idempotent appends or range-aware merges."""
     batch_started = time.perf_counter()
-    timings = {}
+    timings: dict[str, float] = {}
+    row_count = 0
+
     changes = latest_changes(batch, "transaction_id").persist(StorageLevel.MEMORY_AND_DISK)
 
     try:
@@ -421,6 +459,7 @@ def process_transaction_batch(batch: DataFrame, batch_id: int) -> None:
         delete_condition = (F.col("_change_type") == "delete") | F.coalesce(
             F.col("is_deleted"), F.lit(False)
         )
+
         upsert_condition = (F.col("_change_type") != "delete") & ~F.coalesce(
             F.col("is_deleted"), F.lit(False)
         )
@@ -431,6 +470,11 @@ def process_transaction_batch(batch: DataFrame, batch_id: int) -> None:
             F.max(F.when(upsert_condition, 1).otherwise(0)).alias("has_upserts"),
             F.min(F.when(upsert_condition, F.to_date("event_time"))).alias("min_event_date"),
             F.max(F.when(upsert_condition, F.to_date("event_time"))).alias("max_event_date"),
+            F.min(F.when(delete_condition, F.col("transaction_id"))).alias("min_delete_id"),
+            F.max(F.when(delete_condition, F.col("transaction_id"))).alias("max_delete_id"),
+            F.min(F.when(upsert_condition, F.col("transaction_id"))).alias("min_upsert_id"),
+            F.max(F.when(upsert_condition, F.col("transaction_id"))).alias("max_upsert_id"),
+            F.max(F.col("_has_non_insert_event")).alias("has_non_insert_event"),
         ).first()
 
         timings["classify"] = time.perf_counter() - stage_started
@@ -438,6 +482,7 @@ def process_transaction_batch(batch: DataFrame, batch_id: int) -> None:
         row_count = int(stats["row_count"] or 0)
         has_deletes = bool(stats["has_deletes"] or 0)
         has_upserts = bool(stats["has_upserts"] or 0)
+        has_non_insert_event = bool(stats["has_non_insert_event"] or 0)
 
         if row_count == 0:
             return
@@ -455,7 +500,10 @@ def process_transaction_batch(batch: DataFrame, batch_id: int) -> None:
                 .alias("t")
                 .merge(
                     delete_ids.alias("s"),
-                    "t.transaction_id = s.transaction_id",
+                    transaction_range_merge_condition(
+                        stats["min_delete_id"],
+                        stats["max_delete_id"],
+                    ),
                 )
                 .whenMatchedDelete()
                 .execute()
@@ -473,11 +521,13 @@ def process_transaction_batch(batch: DataFrame, batch_id: int) -> None:
         upserts = changes.filter(upsert_condition)
 
         stage_started = time.perf_counter()
+
         ensure_date_keys(
             spark,
             stats["min_event_date"],
             stats["max_event_date"],
         )
+
         timings["ensure_date_keys"] = time.perf_counter() - stage_started
 
         stage_started = time.perf_counter()
@@ -487,25 +537,49 @@ def process_transaction_batch(batch: DataFrame, batch_id: int) -> None:
         try:
             stage_started = time.perf_counter()
 
-            (
-                DeltaTable.forPath(spark, fact_path)
-                .alias("t")
-                .merge(
-                    fact_rows.alias("s"),
-                    "t.transaction_id = s.transaction_id",
+            if not has_non_insert_event and not has_deletes:
+                # Only new, insert-only batches use append. Delta's
+                # transaction identifiers make microbatch retries idempotent.
+                (
+                    fact_rows.write.format("delta")
+                    .mode("append")
+                    .option("txnAppId", TRANSACTION_APPEND_APP_ID)
+                    .option("txnVersion", str(batch_id))
+                    .save(fact_path)
                 )
-                .whenMatchedUpdateAll()
-                .whenNotMatchedInsertAll()
-                .execute()
-            )
 
-            timings["fact_merge"] = time.perf_counter() - stage_started
+                timings["fact_append"] = time.perf_counter() - stage_started
+
+                LOG.info(
+                    "transactions batch %s used the insert-only append path",
+                    batch_id,
+                )
+
+            else:
+                # Preserve MERGE semantics for updates, deletes and mixed
+                # histories, using UUID bounds to constrain target scanning.
+                (
+                    DeltaTable.forPath(spark, fact_path)
+                    .alias("t")
+                    .merge(
+                        fact_rows.alias("s"),
+                        transaction_range_merge_condition(
+                            stats["min_upsert_id"],
+                            stats["max_upsert_id"],
+                        ),
+                    )
+                    .whenMatchedUpdateAll()
+                    .whenNotMatchedInsertAll()
+                    .execute()
+                )
+
+                timings["fact_merge"] = time.perf_counter() - stage_started
 
         finally:
             fact_rows.unpersist(blocking=False)
 
         LOG.info(
-            "transactions batch %s merged into Gold",
+            "transactions batch %s completed in Gold",
             batch_id,
         )
 
@@ -515,8 +589,9 @@ def process_transaction_batch(batch: DataFrame, batch_id: int) -> None:
         timings["total"] = time.perf_counter() - batch_started
 
         LOG.info(
-            "transactions batch %s timing_seconds=%s",
+            "transactions batch %s rows=%s timing_seconds=%s",
             batch_id,
+            row_count,
             {name: round(seconds, 2) for name, seconds in timings.items()},
         )
 
@@ -538,12 +613,12 @@ def main() -> None:
         .config("spark.sql.shuffle.partitions", "4")
         .getOrCreate()
     )
-    spark.sparkContext.setLogLevel("WARN")
 
+    spark.sparkContext.setLogLevel("WARN")
     queries = []
 
     try:
-        # The existing full-refresh pipeline must have built these tables.
+        # Confirm the baseline exists before consuming CDF changes.
         for table_name in (
             "dim_customer",
             "dim_merchant",
@@ -557,6 +632,10 @@ def main() -> None:
                     f"Gold baseline table {table_name} is missing at {path}; "
                     "run the full-refresh Gold pipeline first."
                 )
+
+        # Pay the small date-range query once at startup, not in the first
+        # transaction microbatch.
+        initialize_date_bounds(spark)
 
         streams = [
             (
