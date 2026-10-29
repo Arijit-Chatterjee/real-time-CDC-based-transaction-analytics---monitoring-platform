@@ -389,6 +389,21 @@ The merchant mart contained 500 ranked rows and one unranked row in that run. Al
 
 These figures are a **snapshot of one local run**, not fixed guarantees. Counts can change when source records, event history, or transaction data change.
 
+### End-to-End Reliability Verification
+
+Manual local tests verified customer and merchant inserts and updates, transaction
+inserts and updates, transaction deletion, two-row and five-row micro-batches,
+and Gold catch-up after a normal restart with the existing checkpoint.
+
+A separate temporary-table test confirmed that repeating a Delta append with
+the same transaction application ID and version did not create another row.
+The live Gold fact table also passed a transaction-ID uniqueness check at the
+time of testing.
+
+These checks validate the scenarios exercised; they do not prove behavior for
+every crash/retry timing or replace automated end-to-end integration tests.
+See the [Reliability Test Record](docs/reliability_test_runbook.md) for details.
+
 ## Engineering Principles
 
 StreamGuard emphasizes the following data-engineering practices:
@@ -417,3 +432,4 @@ Potential next steps include:
 ---
 
 StreamGuard is a learning and portfolio project focused on building reliable data pipelines and producing trustworthy analytics-ready datasets using modern data engineering tools.
+

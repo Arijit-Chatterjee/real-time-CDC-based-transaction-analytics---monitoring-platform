@@ -258,3 +258,70 @@ From the project root in PowerShell:
 .\scripts\start_streaming_writers.ps1
 
 This prevents assumptions about names, ports, database users, or container image layouts when moving from StreamGuard to a different project or cloud environment.
+$commands = @'
+## Reliability verification commands
+
+### Run automated tests and code checks
+
+Run from the project root in PowerShell:
+
+```powershell
+uv run pytest -q
+uv run ruff check src/gold/gold_incremental_writer.py src/silver/silver_writer.py
+git diff --check
+
+
+## Reliability verification commands
+
+### Run automated tests and code checks
+
+From the project root in PowerShell:
+
+```powershell
+uv run pytest -q
+uv run ruff check src/gold/gold_incremental_writer.py src/silver/silver_writer.py
+git diff --check
+```
+
+These commands run the unit tests, lint the selected files, and check for whitespace errors.
+
+### Check active Gold writer processes
+
+```powershell
+docker exec streamguard-spark bash -lc 'ps -eo pid,ppid,etime,args | grep -E "[g]old_incremental_writer.py"'
+```
+
+Identify the Python driver process before restarting Gold. The output can include its parent shell and Java Spark process, so do not count every line as a separate writer.
+
+### Inspect Gold micro-batch results
+
+Find recent Gold log files:
+
+```powershell
+docker exec streamguard-spark bash -lc 'ls -lt /tmp/gold_incremental_writer*.log | head'
+```
+
+Inspect the log belonging to the current writer:
+
+```powershell
+docker exec streamguard-spark bash -lc 'grep -E "transactions batch .*rows=|insert-only append path|completed in Gold|ERROR|Exception|Traceback" /tmp/gold_incremental_writer_insertappend.log | tail -n 25'
+```
+
+Replace the example filename when a different log is active.
+
+### Check transaction-ID uniqueness in Gold
+
+Run from `C:\StreamGuard`:
+
+```powershell
+uv run --extra dashboard python -c "from deltalake import DeltaTable; df = DeltaTable('lake/gold/fact_transactions').to_pandas(columns=['transaction_id']); ids = df['transaction_id']; print(f'Total rows: {len(ids)}'); print(f'Distinct IDs: {ids.nunique()}'); print(f'Duplicate-key rows: {len(ids) - ids.nunique()}')"
+```
+
+A zero duplicate count verifies the current Gold snapshot, not every possible future retry scenario.
+
+### Recovery-test safety
+
+- Do not delete streaming checkpoints during a normal restart test.
+- Do not start a second writer against an active writer's checkpoint.
+- For a normal restart test, stop Gold cleanly, verify Bronze and Silver remain active, then restart Gold using the same checkpoint.
+- Do not deliberately crash the live writer at a commit boundary without a separate test environment and a defined recovery procedure.
