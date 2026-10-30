@@ -21,6 +21,11 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
+from src.gold.logic import (
+    should_use_insert_only_append,
+    transaction_range_merge_condition,
+)
+
 SILVER_ROOT = "/opt/streamguard/lake/silver"
 GOLD_ROOT = "/opt/streamguard/lake/gold"
 CHECKPOINT_ROOT = "/opt/streamguard/lake/checkpoints/gold_incremental"
@@ -98,24 +103,6 @@ def latest_changes(batch: DataFrame, key_column: str) -> DataFrame:
         )
         .filter(F.col("_row_number") == 1)
         .drop("_row_number")
-    )
-
-
-def transaction_range_merge_condition(
-    minimum_id: str,
-    maximum_id: str,
-) -> str:
-    """Constrain fact-table target scans to the current batch's UUID range."""
-    if minimum_id is None or maximum_id is None:
-        raise ValueError("Cannot build a transaction merge condition without ID bounds")
-
-    minimum_literal = minimum_id.replace("'", "''")
-    maximum_literal = maximum_id.replace("'", "''")
-
-    return (
-        f"t.transaction_id >= '{minimum_literal}' "
-        f"AND t.transaction_id <= '{maximum_literal}' "
-        "AND t.transaction_id = s.transaction_id"
     )
 
 
@@ -537,7 +524,10 @@ def process_transaction_batch(
         try:
             stage_started = time.perf_counter()
 
-            if not has_non_insert_event and not has_deletes:
+            if should_use_insert_only_append(
+                has_non_insert_event=has_non_insert_event,
+                has_deletes=has_deletes,
+            ):
                 # Only new, insert-only batches use append. Delta's
                 # transaction identifiers make microbatch retries idempotent.
                 (
