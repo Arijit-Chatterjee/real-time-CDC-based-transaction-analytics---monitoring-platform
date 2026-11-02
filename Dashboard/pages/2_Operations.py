@@ -297,6 +297,119 @@ def get_recent_service_log(source: str) -> tuple[str, str]:
     return target, output or "No recent log entries."
 
 
+def get_recent_errors(limit: int = 20) -> tuple[list[str], list[str]]:
+    """Collect recent errors from retained Spark and container logs."""
+
+    error_pattern = re.compile(
+        r"\b(ERROR|FATAL|Exception|Traceback)\b",
+        re.IGNORECASE,
+    )
+
+    scan_lines = 2000
+    records: list[tuple[float, str]] = []
+    problems: list[str] = []
+
+    def timestamp_key(line: str) -> float:
+        """Extract a sortable timestamp from a log line."""
+        match = re.search(
+            r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+            r"(?:[.,]\d+)?(?:Z|[+-]\d{2}:\d{2})?",
+            line,
+        )
+
+        if not match:
+            return 0.0
+
+        try:
+            value = match.group().replace("Z", "+00:00")
+            timestamp = datetime.fromisoformat(value)
+
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=UTC)
+
+            return timestamp.timestamp()
+
+        except (ValueError, OverflowError, OSError):
+            return 0.0
+
+    # Search Spark writer log files together in one Docker command.
+    file_sources = [
+        (name, target)
+        for name, (source_type, target) in LOG_SOURCES.items()
+        if source_type == "file"
+    ]
+
+    script_parts = []
+
+    for name, target in file_sources:
+        script_parts.append(
+            f"for file in {target}; do "
+            '[ -f "$file" ] || continue; '
+            f'tail -n {scan_lines} "$file" | '
+            'grep -Ei "ERROR|FATAL|Exception|Traceback" | '
+            f'sed "s|^|[{name}] $file: |"; '
+            "done"
+        )
+
+    if script_parts:
+        result = run_command(
+            [
+                "docker",
+                "exec",
+                "streamguard-spark",
+                "bash",
+                "-lc",
+                " ".join(script_parts) + "; true",
+            ],
+            timeout=5,
+        )
+
+        if result is None or result.returncode != 0:
+            problems.append("Could not scan Spark writer log files.")
+        else:
+            for line in result.stdout.splitlines():
+                if error_pattern.search(line):
+                    records.append((timestamp_key(line), line))
+
+    # Search retained Docker container logs.
+    for name, (source_type, target) in LOG_SOURCES.items():
+        if source_type != "container":
+            continue
+
+        result = run_command(
+            [
+                "docker",
+                "logs",
+                "--tail",
+                str(scan_lines),
+                "--timestamps",
+                target,
+            ],
+            timeout=5,
+        )
+
+        if result is None:
+            problems.append(f"Could not retrieve {name} logs.")
+            continue
+
+        if result.returncode != 0:
+            problems.append(f"{name}: {result.stderr.strip()}")
+            continue
+
+        output = "\n".join(filter(None, [result.stdout, result.stderr]))
+
+        for line in output.splitlines():
+            if error_pattern.search(line):
+                entry = f"[{name}] {line}"
+                records.append((timestamp_key(line), entry))
+
+    records.sort(key=lambda item: item[0])
+
+    recent = [entry for _, entry in records[-limit:]]
+
+    return recent, problems
+
+
 def format_commit_time(value) -> str:
     """Format a Delta history timestamp for display."""
     try:
@@ -356,6 +469,130 @@ def get_gold_table_metadata() -> pd.DataFrame:
                     "Last commit": str(exc),
                 }
             )
+
+    return pd.DataFrame(rows)
+
+
+def get_pipeline_freshness() -> pd.DataFrame:
+    """Read the latest Bronze, Silver and Gold storage updates."""
+
+    now = datetime.now().astimezone()
+
+    bronze_tables = ["transactions", "customers", "merchants"]
+    silver_tables = ["transactions", "customers", "merchants"]
+
+    table_groups = [
+        ("Bronze", "parquet", bronze_tables),
+        ("Silver", "delta", silver_tables),
+        ("Gold", "delta", GOLD_TABLES),
+    ]
+
+    rows = []
+
+    for layer, storage_format, table_names in table_groups:
+        for table_name in table_names:
+            path = PROJECT_ROOT / "lake" / layer.lower() / table_name
+
+            try:
+                if storage_format == "parquet":
+                    files = path.rglob("*.parquet")
+                    latest_file = max(
+                        files,
+                        key=lambda item: item.stat().st_mtime,
+                        default=None,
+                    )
+
+                    if latest_file is None:
+                        rows.append(
+                            {
+                                "Layer": layer,
+                                "Table": table_name,
+                                "Format": "Parquet",
+                                "Last update": "No files found",
+                                "Age": "Unavailable",
+                                "Latest operation": "Unavailable",
+                            }
+                        )
+                        continue
+
+                    updated_at = datetime.fromtimestamp(latest_file.stat().st_mtime).astimezone()
+
+                    operation = latest_file.name
+
+                else:
+                    if not path.exists():
+                        rows.append(
+                            {
+                                "Layer": layer,
+                                "Table": table_name,
+                                "Format": "Delta",
+                                "Last update": "Table missing",
+                                "Age": "Unavailable",
+                                "Latest operation": "Unavailable",
+                            }
+                        )
+                        continue
+
+                    table = DeltaTable(str(path))
+                    history = table.history(1)
+                    latest = history[0] if history else {}
+
+                    raw_timestamp = latest.get("timestamp")
+
+                    if raw_timestamp is None:
+                        raise ValueError("Latest commit timestamp unavailable")
+
+                    if isinstance(raw_timestamp, (int, float)):
+                        updated_at = datetime.fromtimestamp(
+                            raw_timestamp / 1000,
+                            tz=UTC,
+                        ).astimezone()
+                    else:
+                        updated_at = datetime.fromisoformat(str(raw_timestamp))
+
+                        if updated_at.tzinfo is None:
+                            updated_at = updated_at.replace(tzinfo=UTC)
+
+                        updated_at = updated_at.astimezone()
+
+                    operation = latest.get("operation", "Unknown")
+
+                age_seconds = max(
+                    0,
+                    int((now - updated_at).total_seconds()),
+                )
+
+                if age_seconds < 60:
+                    age = f"{age_seconds} seconds"
+                elif age_seconds < 3600:
+                    age = f"{age_seconds // 60} minutes"
+                elif age_seconds < 86400:
+                    age = f"{age_seconds // 3600} hours"
+                else:
+                    age = f"{age_seconds // 86400} days"
+
+                rows.append(
+                    {
+                        "Layer": layer,
+                        "Table": table_name,
+                        "Format": storage_format.capitalize(),
+                        "Last update": updated_at.strftime("%d %b %Y, %H:%M:%S"),
+                        "Age": age,
+                        "Latest operation": operation,
+                    }
+                )
+
+            except (OSError, ValueError, RuntimeError) as exc:
+                rows.append(
+                    {
+                        "Layer": layer,
+                        "Table": table_name,
+                        "Format": storage_format.capitalize(),
+                        "Last update": "Error",
+                        "Age": "Unavailable",
+                        "Latest operation": str(exc),
+                    }
+                )
 
     return pd.DataFrame(rows)
 
@@ -513,14 +750,25 @@ def render_operations():
     # Gold table metadata
     # --------------------------------------------------------
 
-    st.subheader("Gold Delta Lake tables")
+    st.subheader("Pipeline Data Freshness")
 
-    gold_metadata = get_gold_table_metadata()
+    st.caption(
+        "Latest storage updates across Bronze, Silver and Gold. "
+        "Age measures time since the last file modification or Delta commit; "
+        "it does not independently indicate pipeline health."
+    )
+
+    freshness = get_pipeline_freshness()
 
     st.dataframe(
-        gold_metadata,
+        freshness,
         hide_index=True,
         width="stretch",
+    )
+
+    st.caption(
+        "Bronze uses Parquet file modification times. "
+        "Silver and Gold use Delta transaction history."
     )
 
     st.caption(
@@ -534,7 +782,62 @@ def render_operations():
     # Gold batch activity
     # --------------------------------------------------------
 
-    st.subheader("Recent Gold pipeline activity")
+    # --------------------------------------------------------
+    # Gold batch activity
+    # --------------------------------------------------------
+
+    st.divider()
+    st.subheader("Recent Gold Pipeline Activity")
+
+    gold_log_file, gold_activity = get_latest_gold_log()
+
+    st.caption(f"Log source: {gold_log_file}")
+
+    if gold_activity and "No recent matching events" not in gold_activity:
+        st.code(gold_activity, language="text")
+    else:
+        st.info("No recent Gold pipeline activity was found.")
+
+    st.caption(
+        "Displays the latest available Gold batch events, including "
+        "appends, merges, completion messages and errors."
+    )
+
+    # --------------------------------------------------------
+    # Recent error history
+    # --------------------------------------------------------
+
+    st.divider()
+    st.subheader("Recent Error History")
+
+    st.caption(
+        "Latest 20 matching errors across retained service logs. "
+        "Searches up to 2,000 lines per source."
+    )
+
+    recent_errors, scan_problems = get_recent_errors(limit=20)
+
+    if scan_problems:
+        with st.expander("Log collection warnings"):
+            for problem in scan_problems:
+                st.warning(problem)
+
+    if recent_errors:
+        st.error(f"{len(recent_errors)} matching error entries found.")
+
+        st.code(
+            "\n\n".join(recent_errors),
+            language="text",
+        )
+    elif scan_problems:
+        st.warning("Some log sources could not be inspected.")
+    else:
+        st.success("No matching errors found in the scanned log windows.")
+
+    st.caption(
+        "Errors remain searchable while their source logs are retained. "
+        "This is not a permanent error archive."
+    )
 
     # --------------------------------------------------------
     # Live service logs
@@ -544,7 +847,8 @@ def render_operations():
     st.subheader("Live Service Logs")
 
     st.caption(
-        "Latest five log lines from the selected service. Automatically refreshed every 15 seconds."
+        "Select a service to inspect its five latest log lines. "
+        "Automatically refreshed every 15 seconds."
     )
 
     selected_service = st.selectbox(
@@ -558,32 +862,33 @@ def render_operations():
 
     st.caption(f"Log source: {filename}")
 
-    # Highlight operational errors without hiding the original log entries.
+    log_lines = log_output.splitlines()
+
     error_pattern = re.compile(
         r"\b(ERROR|FATAL|Exception|Traceback)\b",
         re.IGNORECASE,
     )
 
-    log_lines = log_output.splitlines()
     has_errors = any(error_pattern.search(line) for line in log_lines)
 
     if has_errors:
-        st.error("Potential errors detected in recent logs.")
+        st.error("Potential errors detected in the selected service logs.")
+    elif "Could not retrieve" in log_output or "No matching log file found" in log_output:
+        st.warning("Log source could not be read or has no matching file.")
     else:
-        st.success("No obvious errors detected in the latest log lines.")
+        st.success("No obvious errors in the displayed log lines.")
 
-    st.code(
-        "\n".join(log_lines[-10:]) or "No log entries available.",
-        language="text",
-    )
+    if log_lines:
+        st.code(
+            "\n".join(log_lines[-5:]),
+            language="text",
+        )
+    else:
+        st.info("No log entries are currently available.")
 
     st.caption(
-        "This panel displays recent log output, not a complete error history. "
-        "Older errors may no longer appear in the latest five lines."
-    )
-    st.caption(
-        "Log activity is read-only. Historical log entries may remain visible "
-        "after a writer restart; check timestamps before interpreting health."
+        "Only the latest five lines are displayed here. "
+        "Use Recent Error History to search a larger retained log window."
     )
 
 
