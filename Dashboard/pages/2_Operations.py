@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.dataset as ds
 import streamlit as st
 from deltalake import DeltaTable
 
@@ -473,6 +474,175 @@ def get_gold_table_metadata() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+KAFKA_TOPICS = {
+    "transactions": "streamguard.public.transactions",
+    "customers": "streamguard.public.customers",
+    "merchants": "streamguard.public.merchants",
+}
+
+
+def get_kafka_end_offsets(topic: str) -> tuple[dict[int, int], str | None]:
+    """Read Kafka's latest next-offset position for every topic partition."""
+
+    result = run_command(
+        [
+            "docker",
+            "exec",
+            "streamguard-kafka",
+            "/opt/kafka/bin/kafka-get-offsets.sh",
+            "--bootstrap-server",
+            "localhost:9092",
+            "--topic",
+            topic,
+            "--time",
+            "-1",
+        ],
+        timeout=12,
+    )
+
+    if result is None:
+        return {}, "Kafka offset command timed out or failed to execute."
+
+    if result.returncode != 0:
+        return {}, result.stderr.strip() or "Kafka offset query failed."
+
+    offsets = {}
+
+    for line in result.stdout.splitlines():
+        parts = line.strip().rsplit(":", 2)
+
+        if len(parts) != 3 or parts[0] != topic:
+            continue
+
+        try:
+            partition = int(parts[1])
+            end_offset = int(parts[2])
+            offsets[partition] = end_offset
+        except ValueError:
+            continue
+
+    if not offsets:
+        return {}, "Kafka returned no partition offsets."
+
+    return offsets, None
+
+
+def get_max_persisted_offsets(
+    table_path: Path,
+    storage_format: str,
+) -> tuple[dict[int, int], str | None]:
+    """Read maximum persisted Kafka offsets without loading all columns."""
+
+    try:
+        if not table_path.exists():
+            return {}, "Table path does not exist."
+
+        if storage_format == "parquet":
+            dataset = ds.dataset(str(table_path), format="parquet")
+        elif storage_format == "delta":
+            dataset = DeltaTable(str(table_path)).to_pyarrow_dataset()
+        else:
+            return {}, f"Unsupported storage format: {storage_format}"
+
+        frame = dataset.to_table(columns=["kafka_partition", "kafka_offset"]).to_pandas()
+
+        if frame.empty:
+            return {}, None
+
+        frame["kafka_partition"] = pd.to_numeric(frame["kafka_partition"], errors="coerce")
+
+        frame["kafka_offset"] = pd.to_numeric(frame["kafka_offset"], errors="coerce")
+
+        frame = frame.dropna(subset=["kafka_partition", "kafka_offset"])
+
+        if frame.empty:
+            return {}, None
+
+        maxima = frame.groupby("kafka_partition")["kafka_offset"].max()
+
+        return {int(partition): int(offset) for partition, offset in maxima.items()}, None
+
+    except Exception as exc:  # noqa: BLE001
+        # Keep one unreadable table from breaking the entire Operations page.
+        return {}, str(exc)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_pipeline_offset_lag() -> tuple[pd.DataFrame, list[str]]:
+    """Compare Kafka, Bronze and Silver high-watermarks per partition."""
+
+    rows = []
+    warnings = []
+
+    for table_name, topic in KAFKA_TOPICS.items():
+        kafka_offsets, kafka_error = get_kafka_end_offsets(topic)
+
+        if kafka_error:
+            warnings.append(f"{table_name}: Kafka: {kafka_error}")
+            continue
+
+        bronze_offsets, bronze_error = get_max_persisted_offsets(
+            PROJECT_ROOT / "lake" / "bronze" / table_name,
+            "parquet",
+        )
+
+        silver_offsets, silver_error = get_max_persisted_offsets(
+            PROJECT_ROOT / "lake" / "silver" / table_name,
+            "delta",
+        )
+
+        if bronze_error:
+            warnings.append(f"{table_name}: Bronze: {bronze_error}")
+
+        if silver_error:
+            warnings.append(f"{table_name}: Silver: {silver_error}")
+
+        partitions = sorted(set(kafka_offsets) | set(bronze_offsets) | set(silver_offsets))
+
+        for partition in partitions:
+            kafka_end = kafka_offsets.get(partition)
+            bronze_max = bronze_offsets.get(partition)
+            silver_max = silver_offsets.get(partition)
+
+            bronze_gap = (
+                kafka_end - bronze_max - 1
+                if kafka_end is not None and bronze_max is not None
+                else None
+            )
+
+            silver_gap = (
+                kafka_end - silver_max - 1
+                if kafka_end is not None and silver_max is not None
+                else None
+            )
+
+            if kafka_end is None:
+                status = "Kafka offset unavailable"
+            elif bronze_gap is None or silver_gap is None:
+                status = "Incomplete offset data"
+            elif bronze_gap < 0 or silver_gap < 0:
+                status = "Watermark mismatch"
+            elif bronze_gap > 0 or silver_gap > 0:
+                status = "Processing backlog"
+            else:
+                status = "At Kafka high-watermark"
+
+            rows.append(
+                {
+                    "Topic": table_name,
+                    "Partition": partition,
+                    "Kafka end": kafka_end,
+                    "Bronze max": bronze_max,
+                    "Bronze gap": bronze_gap,
+                    "Silver max": silver_max,
+                    "Silver gap": silver_gap,
+                    "Status": status,
+                }
+            )
+
+    return pd.DataFrame(rows), warnings
+
+
 def get_pipeline_freshness() -> pd.DataFrame:
     """Read the latest Bronze, Silver and Gold storage updates."""
 
@@ -769,6 +939,100 @@ def render_operations():
     st.caption(
         "Bronze uses Parquet file modification times. "
         "Silver and Gold use Delta transaction history."
+    )
+
+    # --------------------------------------------------------
+    # Kafka offset and streaming progress
+    # --------------------------------------------------------
+
+    st.divider()
+    st.subheader("Kafka → Bronze → Silver Progress")
+
+    st.caption(
+        "Latest Kafka offsets compared with persisted Bronze and Silver offsets. "
+        "Refreshes using cached data every 30 seconds."
+    )
+
+    with st.spinner("Checking Kafka and storage offsets..."):
+        offset_data, offset_warnings = get_pipeline_offset_lag()
+
+    if offset_warnings:
+        with st.expander("Offset monitoring warnings"):
+            for warning in offset_warnings:
+                st.warning(warning)
+
+    if offset_data.empty:
+        st.warning("Kafka offset information is currently unavailable.")
+
+    else:
+        caught_up = int(offset_data["Status"].eq("At Kafka high-watermark").sum())
+
+        backlog = int(offset_data["Status"].eq("Processing backlog").sum())
+
+        mismatches = int(offset_data["Status"].eq("Watermark mismatch").sum())
+
+        incomplete = int(
+            offset_data["Status"].eq("Incomplete offset data").sum()
+            + offset_data["Status"].eq("Kafka offset unavailable").sum()
+        )
+
+        m1, m2, m3, m4 = st.columns(4)
+
+        m1.metric("Partitions monitored", len(offset_data))
+        m2.metric("Caught up", caught_up)
+        m3.metric("Backlog", backlog)
+        m4.metric("Data issues", mismatches + incomplete)
+
+        if mismatches:
+            st.error(f"{mismatches} partition(s) have offset watermark mismatches.")
+        elif incomplete:
+            st.warning(f"{incomplete} partition(s) have incomplete offset information.")
+        elif backlog:
+            st.warning(f"{backlog} partition(s) have an offset backlog.")
+        else:
+            st.success(
+                "Bronze and Silver have reached Kafka's current "
+                "high-watermark across all monitored partitions."
+            )
+
+        st.dataframe(
+            offset_data,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Topic": "CDC topic",
+                "Partition": st.column_config.NumberColumn(
+                    "Partition",
+                    format="%d",
+                ),
+                "Kafka end": st.column_config.NumberColumn(
+                    "Kafka end offset",
+                    format="%d",
+                ),
+                "Bronze max": st.column_config.NumberColumn(
+                    "Bronze max offset",
+                    format="%d",
+                ),
+                "Bronze gap": st.column_config.NumberColumn(
+                    "Bronze gap",
+                    format="%d",
+                ),
+                "Silver max": st.column_config.NumberColumn(
+                    "Silver max offset",
+                    format="%d",
+                ),
+                "Silver gap": st.column_config.NumberColumn(
+                    "Silver gap",
+                    format="%d",
+                ),
+                "Status": "Partition health",
+            },
+        )
+
+    st.caption(
+        "Offset gaps are high-watermark differences, not proof of "
+        "message-by-message completeness or exact processing latency. "
+        "Kafka retention and topic recreation can also affect comparisons."
     )
 
     st.caption(
