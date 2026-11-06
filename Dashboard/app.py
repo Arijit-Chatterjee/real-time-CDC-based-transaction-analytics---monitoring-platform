@@ -2,9 +2,10 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
 import streamlit as st
 from deltalake import DeltaTable
-
+from deltalake.exceptions import DeltaError
 
 # Locate the project independently of the current working directory.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -115,7 +116,7 @@ def render_dashboard():
     try:
         with st.spinner("Reading Gold analytics..."):
             facts, mart = load_gold_data()
-    except Exception as exc:
+    except (DeltaError, pa.ArrowException, OSError, KeyError, ValueError) as exc:
         st.error(
             "Could not read the Gold tables. Confirm that both Delta "
             "tables exist and that their files are accessible from Windows."

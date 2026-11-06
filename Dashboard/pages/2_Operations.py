@@ -235,6 +235,133 @@ LOG_SOURCES = {
 }
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def get_gold_batch_history(
+    limit: int = 10,
+) -> tuple[str, pd.DataFrame, str | None]:
+    """Parse recent Gold transaction batch metrics from the latest writer log."""
+
+    script = r"""
+latest=$(ls -t /tmp/gold_incremental_writer*.log 2>/dev/null | head -n 1)
+
+if [ -n "$latest" ]; then
+    printf 'LOG_FILE=%s\n' "$latest"
+    tail -n 500 "$latest"
+else
+    echo "No Gold writer log found."
+fi
+"""
+
+    result = run_command(
+        [
+            "docker",
+            "exec",
+            "streamguard-spark",
+            "bash",
+            "-lc",
+            script,
+        ],
+        timeout=8,
+    )
+
+    columns = [
+        "Batch ID",
+        "Status",
+        "Completion time",
+        "Rows",
+        "Duration (seconds)",
+        "Write path",
+    ]
+
+    if result is None or result.returncode != 0:
+        return (
+            "Unavailable",
+            pd.DataFrame(columns=columns),
+            ("Could not retrieve Gold writer logs."),
+        )
+
+    lines = result.stdout.splitlines()
+
+    if not lines or not lines[0].startswith("LOG_FILE="):
+        return "Unavailable", pd.DataFrame(columns=columns), ("No Gold writer log file was found.")
+
+    filename = lines[0].split("=", 1)[1]
+
+    records = {}
+
+    for line in lines[1:]:
+        batch_match = re.search(r"transactions batch (\d+)", line)
+
+        if not batch_match:
+            continue
+
+        batch_id = int(batch_match.group(1))
+
+        record = records.setdefault(
+            batch_id,
+            {
+                "Batch ID": batch_id,
+                "Status": "Not confirmed",
+                "Completion time": "Unavailable",
+                "Rows": None,
+                "Duration (seconds)": None,
+                "Write path": "Not identified",
+            },
+        )
+
+        timestamp_match = re.match(
+            r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3})",
+            line,
+        )
+
+        if timestamp_match and "completed in Gold" in line:
+            try:
+                completed_at = (
+                    datetime.strptime(
+                        timestamp_match.group(1),
+                        "%Y-%m-%d %H:%M:%S,%f",
+                    )
+                    .replace(tzinfo=UTC)
+                    .astimezone()
+                )
+
+                record["Completion time"] = completed_at.strftime("%d %b %Y, %H:%M:%S %Z")
+                record["Status"] = "Completed"
+
+            except ValueError:
+                record["Completion time"] = "Timestamp unavailable"
+
+        rows_match = re.search(r"rows=(\d+)", line)
+
+        if rows_match:
+            record["Rows"] = int(rows_match.group(1))
+
+        duration_match = re.search(
+            r"""['"]total['"]\s*:\s*([0-9]+(?:\.[0-9]+)?)""",
+            line,
+        )
+
+        if duration_match:
+            record["Duration (seconds)"] = float(duration_match.group(1))
+
+        if "used the insert-only append path" in line:
+            record["Write path"] = "Insert-only append"
+        elif "delete_merge" in line:
+            record["Write path"] = "Delete merge"
+        elif "fact_merge" in line:
+            record["Write path"] = "Fact merge"
+        elif "fact_append" in line:
+            record["Write path"] = "Fact append"
+
+    history = sorted(
+        records.values(),
+        key=lambda item: item["Batch ID"],
+        reverse=True,
+    )[:limit]
+
+    return filename, pd.DataFrame(history, columns=columns), None
+
+
 def get_recent_service_log(source: str) -> tuple[str, str]:
     """Return the latest five log lines for a selected service."""
 
@@ -1046,25 +1173,104 @@ def render_operations():
     # Gold batch activity
     # --------------------------------------------------------
 
-    # --------------------------------------------------------
-    # Gold batch activity
-    # --------------------------------------------------------
-
     st.divider()
     st.subheader("Recent Gold Pipeline Activity")
 
-    gold_log_file, gold_activity = get_latest_gold_log()
+    # --------------------------------------------------------
+    # Gold execution monitoring
+    # --------------------------------------------------------
 
-    st.caption(f"Log source: {gold_log_file}")
+    st.divider()
+    st.subheader("Gold Execution Monitor")
 
-    if gold_activity and "No recent matching events" not in gold_activity:
-        st.code(gold_activity, language="text")
+    batch_log_file, batch_history, batch_error = get_gold_batch_history(limit=10)
+
+    st.caption(f"Gold log source: {batch_log_file}")
+
+    if batch_error:
+        st.warning(batch_error)
+
+    elif not batch_history.empty:
+        completed_history = batch_history[batch_history["Status"] == "Completed"]
+
+        if not completed_history.empty:
+            latest = completed_history.iloc[0]
+
+            m1, m2, m3, m4 = st.columns(4)
+
+            m1.metric(
+                "Last successful batch",
+                str(latest["Batch ID"]),
+            )
+
+            m2.metric(
+                "Rows processed",
+                str(latest["Rows"]) if pd.notna(latest["Rows"]) else "Unknown",
+            )
+
+            m3.metric(
+                "Duration",
+                f"{latest['Duration (seconds)']:.2f}s"
+                if pd.notna(latest["Duration (seconds)"])
+                else "Unknown",
+            )
+
+            m4.metric(
+                "Write path",
+                str(latest["Write path"]),
+            )
+
+            st.success(
+                f"Latest confirmed successful batch: "
+                f"{latest['Batch ID']} · {latest['Completion time']}"
+            )
+
+        else:
+            st.info("No completed Gold transaction batches were found.")
+
+        st.subheader("Recent Gold batch history")
+
+        st.dataframe(
+            batch_history,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Batch ID": st.column_config.NumberColumn(
+                    "Batch ID",
+                    format="%d",
+                ),
+                "Rows": st.column_config.NumberColumn(
+                    "Rows processed",
+                    format="%d",
+                ),
+                "Duration (seconds)": st.column_config.NumberColumn(
+                    "Duration (seconds)",
+                    format="%.2f",
+                ),
+            },
+        )
+
     else:
-        st.info("No recent Gold pipeline activity was found.")
+        st.info("No Gold batch history is currently available.")
 
     st.caption(
-        "Displays the latest available Gold batch events, including "
-        "appends, merges, completion messages and errors."
+        "Batch completion is determined from explicit completion log messages. "
+        "This is a recent-history view, not a durable audit archive."
+    )
+
+    # --------------------------------------------------------
+    # Recent Gold log output
+    # --------------------------------------------------------
+
+    gold_log_file, gold_activity = get_latest_gold_log()
+
+    with st.expander("View recent Gold log lines"):
+        st.caption(f"Log source: {gold_log_file}")
+        st.code(gold_activity, language="text")
+
+    st.caption(
+        "Gold batch metrics are extracted from the most recent retained "
+        "writer log, so history may be incomplete after log rotation."
     )
 
     # --------------------------------------------------------
